@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# Data and generated artefacts: tens of GB, never commit (see README "Data")
+# ---------------------------------------------------------------------------
+dataset/
+runs/
+output/
+optuna/
+
+# Any stray large data / model files outside those folders
+*.parquet
+*.npz
+*.npy
+*.joblib
+*.tsv
+*.csv
+*.zip
+*.log
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.claude/
+Thumbs.db
+desktop.ini
+.DS_Store
