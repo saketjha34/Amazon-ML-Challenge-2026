@@ -84,6 +84,14 @@ def _atomic_save(df: pd.DataFrame, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _ids_match(cached_ids, expected_ids, min_cover: float = 0.9) -> bool:
+    """A cached pair/feature file belongs to this split: its S1 ids are a subset of the expected ids and
+    cover most of them (S1 without any candidate are legitimately absent)."""
+    got = set(pd.unique(np.asarray(cached_ids, dtype=object)))
+    exp = set(expected_ids)
+    return bool(got) and got <= exp and len(got) >= min_cover * len(exp)
+
+
 def _free_gpu() -> None:
     from src.blocking import _free_memory
     _free_memory()
@@ -108,7 +116,9 @@ class EntityResolutionPipeline:
         if self.config.USE_BLOCK_RANKER and path.is_file():
             import joblib
             ranker = joblib.load(path)
-            ranker.device = "cuda" if p.get("use_gpu", True) else "cpu"
+            # CPU on purpose: XGBoost keeps its GPU memory for the whole process, which starved the
+            # cuSPARSE top-K search (GPU out-of-memory on India test blocking). The ranker is small.
+            ranker.device = "cpu"
             p["ranker"] = ranker
         return p
 
@@ -187,8 +197,14 @@ class EntityResolutionPipeline:
         cur_topk = dict(self.config.BLOCKING_PARAMS["topk"])
         if path.is_file() and not force:
             old = joblib.load(path)
-            if getattr(old, "topk", None) != cur_topk:
-                print(f"  [Ranker] Retrieval config changed ({getattr(old, 'topk', None)} -> {cur_topk}): retraining")
+            from src.blocking import RANKER_FEATURES
+            if getattr(old, "features", None) != list(RANKER_FEATURES):
+                print("  [Ranker] Blocking signals changed (new rules / reverse retrieval): retraining the ranker")
+                force = True
+            elif getattr(old, "topk", None) != cur_topk:
+                print(f"  [Ranker] Retrieval config changed ({getattr(old, 'topk', None)} -> {cur_topk}): retraining. "
+                      f"NOTE: blocking checkpoints fingerprinted with the old ranker (e.g. test blocking copied by "
+                      f"--init-from) will be rebuilt.")
                 force = True
         if not self.config.USE_BLOCK_RANKER or (path.is_file() and not force):
             if prog:
@@ -226,6 +242,75 @@ class EntityResolutionPipeline:
         ranker = BlockRanker(device=dev, topk=cur_topk).fit(X, y)
         joblib.dump(ranker, path)
         print(f"  Saved blocking ranker to {path}")
+
+    def _other_run_ids(self, runs: List[str], which=("train", "val")) -> set:
+        out = set()
+        for r in runs:
+            for w in which:
+                f = self.rm.runs_dir / r / f"{w}_s1_ids.npy"
+                if not f.is_file():
+                    raise FileNotFoundError(f"{f} not found (needed by --exclude-runs / --ensemble-with)")
+                out.update(np.load(f, allow_pickle=True).tolist())
+        return out
+
+    def _split(self) -> Tuple[List[str], List[str]]:
+        excl = self._other_run_ids(self.config.SAMPLE_EXCLUDE_RUNS) if self.config.SAMPLE_EXCLUDE_RUNS else None
+        if excl:
+            print(f"  Excluding {len(excl):,} S1 used by {self.config.SAMPLE_EXCLUDE_RUNS} (disjoint sample)")
+        return split_s1_entities(
+            s1_parquet_path=self.config.TRAIN_S1_PATH,
+            train_ratio=self.config.TRAIN_SPLIT_RATIO,
+            val_ratio=self.config.VAL_SPLIT_RATIO,
+            random_seed=self.config.RANDOM_SEED,
+            sample_size=self.config.SAMPLE_SIZE_S1,
+            sample_seed=self.config.SAMPLE_SEED,
+            exclude_ids=excl,
+        )
+
+    def _scorers(self, model, model2) -> List[Tuple[str, Any, Any]]:
+        """This run's (stage-1, stage-2) models plus those of every --ensemble-with run."""
+        out = [(self.rm.run_name, model, model2)]
+        for r in self.config.ENSEMBLE_RUNS:
+            mdir = self.rm.runs_dir / r / "models"
+            m1 = EntityMatcherModel.load(mdir / "model.joblib")
+            m2 = (EntityMatcherModel.load(mdir / "model_stage2.joblib")
+                  if self.config.USE_STACKING and (mdir / "model_stage2.joblib").is_file() else None)
+            out.append((r, m1, m2))
+        if len(out) > 1:
+            print(f"  [Ensemble] averaging {len(out)} runs: {[t for t, _, _ in out]}")
+        return out
+
+    def _ensemble_files(self) -> List[list]:
+        files = []
+        for r in self.config.ENSEMBLE_RUNS:
+            for n in ("model.joblib", "model_stage2.joblib"):
+                p = self.rm.runs_dir / r / "models" / n
+                if p.is_file():
+                    files.append([r, n, p.stat().st_size, int(p.stat().st_mtime)])
+        return files
+
+    def _orphan_weights(self, y: pd.Series, pairs: pd.DataFrame, gt_map: Dict[str, set]) -> Optional[np.ndarray]:
+        """Same distractor weights as final training (negatives on targets owned by no S1)."""
+        w_orphan = float(self.config.ORPHAN_NEG_WEIGHT or 1.0)
+        if w_orphan == 1.0:
+            return None
+        owned = {t for ts in gt_map.values() for t in ts}
+        orphan_neg = (np.asarray(y) == 0) & ~np.fromiter((c in owned for c in pairs["candidate_id"].values),
+                                                         dtype=bool, count=len(pairs))
+        return np.where(orphan_neg, w_orphan, 1.0).astype(np.float32)
+
+    def _score(self, scorers, X: pd.DataFrame, meta: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """Average stage-1 and final probabilities over all scorers (each run's own stage 2 uses its own p1)."""
+        p1_sum = prob_sum = None
+        for _, m1, m2 in scorers:
+            p1 = np.asarray(m1.predict_proba(X, batch_size=self.config.BATCH_SIZE), dtype=np.float32)
+            prob = (np.asarray(m2.predict_proba(_stage2_input(X, meta[STACK_META], p1),
+                                                batch_size=self.config.BATCH_SIZE), dtype=np.float32)
+                    if m2 is not None else p1)
+            p1_sum = p1 if p1_sum is None else p1_sum + p1
+            prob_sum = prob if prob_sum is None else prob_sum + prob
+        k = np.float32(len(scorers))
+        return p1_sum / k, prob_sum / k
 
     def _load_model_and_fe(self, model, fe):
         if model is None:
@@ -286,19 +371,23 @@ class EntityResolutionPipeline:
         print(f"  Loaded GT mapping for {len(gt_map):,} Source 1 entities.")
 
         prog.step("2", f"Splitting Source 1 entities ({int(self.config.TRAIN_SPLIT_RATIO * 100)}-{int(self.config.VAL_SPLIT_RATIO * 100)} split)")
-        train_s1_ids, val_s1_ids = split_s1_entities(
-            s1_parquet_path=self.config.TRAIN_S1_PATH,
-            train_ratio=self.config.TRAIN_SPLIT_RATIO,
-            val_ratio=self.config.VAL_SPLIT_RATIO,
-            random_seed=self.config.RANDOM_SEED,
-            sample_size=self.config.SAMPLE_SIZE_S1,
-        )
+        train_s1_ids, val_s1_ids = self._split()
         print(f"  Train S1 entities: {len(train_s1_ids):,}")
         print(f"  Validation S1 entities: {len(val_s1_ids):,}")
         np.save(self.rm.run_dir / "train_s1_ids.npy", np.array(train_s1_ids))
         np.save(self.rm.run_dir / "val_s1_ids.npy", np.array(val_s1_ids))
 
         fe = FeatureExtractor()
+        if ckpt_train_features.is_file() and not _ids_match(
+                pd.read_parquet(ckpt_train_features, columns=["s1_id"])["s1_id"].values, train_s1_ids):
+            print(f"  [Checkpoint] {ckpt_train_features.name} was built for a different S1 sample -> recomputing")
+            ckpt_train_features.unlink()
+            ckpt_train_pairs.unlink(missing_ok=True)
+            (self.rm.features_dir / "train_context.parquet").unlink(missing_ok=True)
+        if ckpt_train_pairs.is_file() and not _ids_match(
+                pd.read_parquet(ckpt_train_pairs, columns=["s1_id"])["s1_id"].values, train_s1_ids):
+            print(f"  [Checkpoint] {ckpt_train_pairs.name} was built for a different S1 sample -> re-blocking")
+            ckpt_train_pairs.unlink()
         if not force_recompute and ckpt_train_features.is_file() and fe_path.is_file():
             self._train_block_ranker(train_s1_ids, gt_map, force=False, prog=prog)
             prog.step("3", f"Loading cached training features (steps 3-5) from {ckpt_train_features.name}")
@@ -423,6 +512,8 @@ class EntityResolutionPipeline:
                 val_s1_ids=val_ids,
                 output_dir=self.rm.run_dir / "optuna",
                 train_groups=train_pairs_df["s1_id"].values,
+                sample_weight=self._orphan_weights(y_train, train_pairs_df, gt_map),
+                fp_weight=float(self.config.THRESHOLD_FP_WEIGHT or 1.0),
             )
             model_params = best_p
         else:
@@ -446,9 +537,24 @@ class EntityResolutionPipeline:
         X_train = X_train.reset_index(drop=True)
         y_train = y_train.reset_index(drop=True)
         n_folds = self.config.STACK_OOF_FOLDS
+        # Distractor-aware weights. The test set has ~40% targets that belong to no S1 business
+        # (unmatched in our test predictions; 23% more targets per S1 than train) vs 26% in the training
+        # ground truth, and leaderboard probes confirmed false matches cost more on test than on
+        # validation. Negatives whose target has NO owner in the ground truth are up-weighted by the
+        # odds ratio so the model's probabilities reflect the test-time distractor density.
+        owned = {t for ts in gt_map.values() for t in ts}
+        w_orphan = float(self.config.ORPHAN_NEG_WEIGHT or 1.0)
+        orphan_neg = ((y_train.values == 0)
+                      & ~np.fromiter((c in owned for c in train_pairs_df["candidate_id"].values), dtype=bool,
+                                     count=len(train_pairs_df)))
+        weights = np.where(orphan_neg, w_orphan, 1.0).astype(np.float32) if w_orphan != 1.0 else None
+        print(f"  [Weights] negatives on unowned (distractor) targets: {orphan_neg.sum():,} "
+              f"({orphan_neg.mean():.1%} of pairs) x{w_orphan}")
+        del owned
         tsig = _sig_hash({"features": list(X_train.columns), "n": len(X_train), "pos": int(y_train.sum()),
                           "model_type": self.config.MODEL_TYPE, "device": self.config.DEVICE,
-                          "params": model_params, "stacking": self.config.USE_STACKING, "folds": n_folds})
+                          "params": model_params, "stacking": self.config.USE_STACKING, "folds": n_folds,
+                          "orphan_weight": w_orphan})
         state_path = self.rm.models_dir / "train_state.json"
         state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
         if state.get("sig") != tsig or force_recompute:
@@ -479,7 +585,8 @@ class EntityResolutionPipeline:
                         print(f"  [Checkpoint] OOF fold {k + 1}/{n_folds} loaded")
                         continue
                     m = new_model()
-                    m.train(X_train.iloc[tr_i], y_train.iloc[tr_i])
+                    m.train(X_train.iloc[tr_i], y_train.iloc[tr_i],
+                            sample_weight=None if weights is None else weights[tr_i])
                     pred = m.predict_proba(X_train.iloc[va_i], batch_size=self.config.BATCH_SIZE).astype(np.float32)
                     np.save(fpath.with_suffix(".tmp.npy"), pred)
                     os.replace(fpath.with_suffix(".tmp.npy"), fpath)
@@ -489,7 +596,7 @@ class EntityResolutionPipeline:
                 print("  [Stacking] Stage 2: training on stage-1 features + sibling/stacking features...")
                 X2 = _stage2_input(X_train, train_pairs_df[STACK_META], oof)
                 model2 = new_model()
-                model2.train(X2, y_train)
+                model2.train(X2, y_train, sample_weight=weights)
                 model2.save(stage2_path)
                 mark("stage2")
                 del X2
@@ -505,7 +612,7 @@ class EntityResolutionPipeline:
         else:
             print("  Stage 1: training on all training pairs...")
             model = new_model()
-            model.train(X_train, y_train)
+            model.train(X_train, y_train, sample_weight=weights)
             model.save(stage1_path)
             model.save(self.rm.models_dir / "lightgbm_model.joblib")
             mark("stage1")
@@ -559,13 +666,7 @@ class EntityResolutionPipeline:
         if val_s1_ids_path.is_file():
             val_s1_ids = list(np.load(val_s1_ids_path, allow_pickle=True))
         else:
-            _, val_s1_ids = split_s1_entities(
-                s1_parquet_path=self.config.TRAIN_S1_PATH,
-                train_ratio=self.config.TRAIN_SPLIT_RATIO,
-                val_ratio=self.config.VAL_SPLIT_RATIO,
-                random_seed=self.config.RANDOM_SEED,
-                sample_size=self.config.SAMPLE_SIZE_S1,
-            )
+            _, val_s1_ids = self._split()
         val_ckpt = self.rm.checkpoints_dir / "val"
         if force_recompute and val_ckpt.exists():
             import shutil
@@ -583,6 +684,12 @@ class EntityResolutionPipeline:
         ckpt_val_pairs = self.rm.checkpoints_dir / "val_pairs.parquet"
         ckpt_val_features = self.rm.features_dir / "val_features.parquet"
 
+        for ck in (ckpt_val_features, ckpt_val_pairs):
+            if ck.is_file() and not _ids_match(pd.read_parquet(ck, columns=["s1_id"])["s1_id"].values,
+                                               eval_val_s1_ids):
+                print(f"  [Checkpoint] {ck.name} was built for a different validation sample -> recomputing")
+                ck.unlink()
+                (self.rm.features_dir / "val_context.parquet").unlink(missing_ok=True)
         if not force_recompute and ckpt_val_features.is_file():
             prog.step("2", f"Loading cached validation features from {ckpt_val_features.name}")
             cached_val_df = pd.read_parquet(ckpt_val_features)
@@ -624,13 +731,14 @@ class EntityResolutionPipeline:
         X_val = _with_ctx(X_val, self._context(val_pairs_df, test=False,
                                                cache=self.rm.features_dir / "val_context.parquet",
                                                force=force_recompute))
-        print(f"  Predicting match probabilities with {model.model_type.upper()} (stage 1)...")
-        p1_val = model.predict_proba(X_val, batch_size=self.config.BATCH_SIZE)
-        val_probs = p1_val
-        if model2 is not None:
-            print("  Re-scoring with stage-2 stacking model...")
-            val_probs = model2.predict_proba(_stage2_input(X_val, val_pairs_df[STACK_META], p1_val),
-                                             batch_size=self.config.BATCH_SIZE)
+        if self.config.ENSEMBLE_RUNS:
+            leak = set(eval_val_s1_ids) & self._other_run_ids(self.config.ENSEMBLE_RUNS, which=("train",))
+            if leak:
+                print(f"  [Ensemble WARNING] {len(leak):,} validation S1 were TRAINING data of an ensembled run: "
+                      f"validation scores and thresholds will be optimistic. Train the new run with "
+                      f"--exclude-runs {','.join(self.config.ENSEMBLE_RUNS)}.")
+        print(f"  Predicting match probabilities with {model.model_type.upper()} (stage 1 + stage 2)...")
+        p1_val, val_probs = self._score(self._scorers(model, model2), X_val, val_pairs_df)
 
         cr = candidate_recall(val_pairs_df, gt_map, eval_val_s1_ids)
         print(f"  Blocking recall ceiling: {cr['candidate_recall']:.4f} ({cr['avg_candidates_per_s1']:.1f} candidates / S1)")
@@ -643,7 +751,10 @@ class EntityResolutionPipeline:
             max_matches_per_s1=self.config.MAX_MATCHES_PER_S1,
         )
         opt_1d, sweep_df = sweep_thresholds(exclusive_targets=self.config.EXCLUSIVE_TARGETS, **sweep_kw)
-        (t1, t2), sweep2_df = sweep_thresholds_2d(exclusive_targets=self.config.EXCLUSIVE_TARGETS, **sweep_kw)
+        fpw = float(self.config.THRESHOLD_FP_WEIGHT or 1.0)
+        (t1, t2), sweep2_df = sweep_thresholds_2d(exclusive_targets=self.config.EXCLUSIVE_TARGETS,
+                                                  fp_weight=fpw, **sweep_kw)
+        val_opt = sweep2_df.loc[sweep2_df["macro_f05"].idxmax()]
         _, sweep_noex = sweep_thresholds(exclusive_targets=False, **sweep_kw)
         f05_stage1 = None
         if model2 is not None:
@@ -674,7 +785,9 @@ class EntityResolutionPipeline:
         print(f"  Single threshold + exclusivity   : F0.5 {best_1d['macro_f05']:.4f} @ {opt_1d:.2f}")
         if f05_stage1 is not None:
             print(f"  Stage 1 only (t1/t2 + excl.)     : F0.5 {f05_stage1:.4f}")
-        print(f"OPTIMAL (t1 top-1, t2 others): t1={t1:.2f}  t2={t2:.2f}")
+        print(f"  Validation-optimal thresholds  : t1={val_opt['t1']:.2f} t2={val_opt['t2']:.2f} "
+              f"(F0.5 {val_opt['macro_f05']:.4f})")
+        print(f"CHOSEN for test (false matches weighted x{fpw}): t1={t1:.2f}  t2={t2:.2f}")
         print(f"  Macro F_0.5 Score     : {best['macro_f05']:.4f}")
         print(f"  Precision             : {best['precision']:.4f}")
         print(f"  Recall                : {best['recall']:.4f}")
@@ -707,6 +820,10 @@ class EntityResolutionPipeline:
 
         metrics_summary = {
             "optimal_threshold": t2,
+            "threshold_fp_weight": fpw,
+            "val_optimal_t1": float(val_opt["t1"]),
+            "val_optimal_t2": float(val_opt["t2"]),
+            "val_optimal_macro_f05": float(val_opt["macro_f05"]),
             "threshold_top1": t1,
             "threshold_rest": t2,
             "best_macro_f05": float(best["macro_f05"]),
@@ -720,6 +837,7 @@ class EntityResolutionPipeline:
             "macro_f05_stage1_only": f05_stage1,
             **diag,
             "context_features": bool(self.config.USE_CONTEXT),
+            "ensemble_runs": [self.rm.run_name] + list(self.config.ENSEMBLE_RUNS),
             "stacking": model2 is not None,
             "exclusive_targets": bool(self.config.EXCLUSIVE_TARGETS),
             "val_s1_entities": len(eval_val_s1_ids),
@@ -768,6 +886,14 @@ class EntityResolutionPipeline:
         print(f"  Scoring: stage 1{' + stage-2 stacking' if model2 is not None else ' only'}")
 
         t1, t2 = self._resolve_thresholds(threshold)
+        # Thresholds are only valid for the model set they were tuned on: follow metrics.json
+        mpath = self.rm.metrics_dir / "metrics.json"
+        if mpath.is_file():
+            tuned = json.loads(mpath.read_text(encoding="utf-8")).get("ensemble_runs", [self.rm.run_name])[1:]
+            if list(tuned) != list(self.config.ENSEMBLE_RUNS):
+                print(f"  [Ensemble] thresholds in metrics.json were tuned for ensemble {tuned or 'none'} "
+                      f"-> using that (not {self.config.ENSEMBLE_RUNS or 'none'})")
+                self.config.ENSEMBLE_RUNS = list(tuned)
         if threshold_top1 is not None:
             t1 = float(threshold_top1)
         print(f"  Decision thresholds: top-1 t1={t1:.4f}, others t2={t2:.4f} "
@@ -822,7 +948,8 @@ class EntityResolutionPipeline:
                 "models": [[p.name, p.stat().st_size, int(p.stat().st_mtime)]
                            for p in [self.rm.models_dir / "model.joblib", self.rm.models_dir / "model_stage2.joblib"]
                            if p.is_file()] + [bool(model2 is not None)],
-                "context": CTX_VERSION if self.config.USE_CONTEXT else None}
+                "context": CTX_VERSION if self.config.USE_CONTEXT else None,
+                "ensemble": self._ensemble_files()}
         ssig_path = score_dir / "signature.json"
         if ssig_path.is_file() and json.loads(ssig_path.read_text(encoding="utf-8")) != ssig:
             print("  [Checkpoint] model / thresholds / blocking changed -> discarding scoring checkpoints")
@@ -835,6 +962,7 @@ class EntityResolutionPipeline:
             return score_dir / f"{stem}.parquet", score_dir / f"{stem}.cand.tsv"
 
         todo = [c for c in chunk_paths if not part_paths(c)[0].is_file()]
+        scorers = self._scorers(model, model2)
         prog.step("3", f"Features + scoring {len(chunk_paths)} chunks ({len(chunk_paths) - len(todo)} already done)")
         ctx_builder = None
         if self.config.USE_CONTEXT and todo:
@@ -854,11 +982,7 @@ class EntityResolutionPipeline:
                 country = cpath.parent.parent.name
                 X = _with_ctx(X, ctx_builder.features(chunk_df["s1_id"].values, chunk_df["candidate_id"].values,
                                                       np.full(len(chunk_df), country, dtype=object)))
-            p1 = model.predict_proba(X, batch_size=self.config.BATCH_SIZE)
-            probs = p1
-            if model2 is not None:
-                probs = model2.predict_proba(_stage2_input(X, chunk_df[STACK_META], p1),
-                                             batch_size=self.config.BATCH_SIZE)
+            p1, probs = self._score(scorers, X, chunk_df)
             del X
             probs = np.asarray(probs, dtype=np.float32).copy()
             probs[chunk_df["rule"].values == "exact_name_addr"] = 1.0
@@ -989,6 +1113,49 @@ class EntityResolutionPipeline:
             "total_links": total_links,
             "elapsed_seconds": elapsed,
         }
+
+    def run_decide(self, t1: float, t2: float) -> Dict[str, Any]:
+        """
+        Re-apply the decision layer to the saved test scores (checkpoints/test_scored.parquet) with new
+        thresholds - seconds instead of re-scoring. Writes output/decide_t1_<t1>_t2_<t2>/ with
+        matching_results.tsv + candidate_pairs.tsv (copied) and runs the validator on them.
+        The saved scores only contain pairs with prob >= the kept floor, so t1, t2 must be >= that floor.
+        """
+        import shutil
+        scored_path = self.rm.checkpoints_dir / "test_scored.parquet"
+        cand_path = self.rm.output_dir / "candidate_pairs.tsv"
+        if not scored_path.is_file() or not cand_path.is_file():
+            raise FileNotFoundError(f"{scored_path} / {cand_path} missing: run --mode test once first.")
+        scored = pd.read_parquet(scored_path, columns=["s1_id", "candidate_id", "s1_country", "prob"])
+        floor = float(scored["prob"].min()) if len(scored) else 0.0
+        if min(t1, t2) < floor - 1e-4:
+            raise ValueError(f"Saved test scores only keep prob >= {floor:.3f}; choose thresholds >= that "
+                             f"(or rerun --mode test with lower thresholds in metrics.json).")
+        all_ids = get_all_s1_ids(self.config.TEST_S1_PATH, limit=self.config.SAMPLE_SIZE_S1)
+        match = decide_matches(scored[["s1_id", "candidate_id", "prob"]], t1, t2,
+                               max_matches_per_s1=self.config.MAX_MATCHES_PER_S1,
+                               exclusive_targets=self.config.EXCLUSIVE_TARGETS)
+        out_dir = self.rm.output_dir / f"decide_t1_{t1:.2f}_t2_{t2:.2f}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rows = [",".join(match.get(i, [])) for i in all_ids]
+        pd.DataFrame({"source1_entity_id": all_ids, "matched_entity_ids": rows}).to_csv(
+            out_dir / "matching_results.tsv", sep="\t", index=False, encoding="utf-8")
+        shutil.copy2(cand_path, out_dir / "candidate_pairs.tsv")
+        n_links = sum(len(r.split(",")) for r in rows if r)
+        n_matched = sum(1 for r in rows if r)
+        country = scored.drop_duplicates("s1_id").set_index("s1_id")["s1_country"]
+        k = pd.Series([len(r.split(",")) if r else 0 for r in rows], index=all_ids)
+        by_c = pd.DataFrame({"k": k.values, "country": k.index.map(country).fillna("(none)")})
+        print(f"\n[DECIDE] t1={t1:.2f} t2={t2:.2f}: {n_matched:,}/{len(all_ids):,} S1 matched, {n_links:,} links")
+        print(by_c.groupby("country")["k"].agg(links_per_s1="mean", matched=lambda x: (x > 0).mean()).to_string())
+        if self.config.VALIDATOR_PATH.is_file() and not self.config.SAMPLE_SIZE_S1:
+            res = subprocess.run([sys.executable, str(self.config.VALIDATOR_PATH), "--matching",
+                                  str(out_dir / "matching_results.tsv"), "--candidate",
+                                  str(out_dir / "candidate_pairs.tsv"), "--test-dir", str(self.config.TEST_DIR)],
+                                 capture_output=True, text=True)
+            print(res.stdout[-600:])
+        print(f"  Submission file: {out_dir / 'matching_results.tsv'}")
+        return {"t1": t1, "t2": t2, "links": n_links, "matched_s1": n_matched, "dir": str(out_dir)}
 
     def run_all(
         self,

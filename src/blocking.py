@@ -33,14 +33,19 @@ from sklearn.preprocessing import normalize
 from sparse_dot_topn import sp_matmul_topn
 
 from src.text_norm import ensure_norm, NORM_VERSION
-from src.gpu_topk import GPU_AVAILABLE, GpuTargetMatrix, gpu_topn
+from src.gpu_topk import GPU_AVAILABLE, GpuGuard, GpuTargetMatrix, free_gpu, gpu_topn
 from src.progress import pbar
 from src.resources import cpu_threads
 
 RULE_NAMES = [
     "exact_name", "core_name", "name_key", "skel_key", "exact_addr", "prefix4_house",
     "cw12_state", "num_state", "skel1_state", "knn_name", "knn_skel", "knn_addr", "knn_combo",
+    # Reverse retrieval: the S1 is one of the target's best S1 businesses in the WHOLE S1 file (from the
+    # context rival tables). S1->target top-K misses targets with short / partial addresses or heavy
+    # transliteration because thousands of other targets outrank them; target->S1 finds them.
+    "rev_knn",
 ]
+REV_MISSING_RANK = 9                  # rev_rank of a pair that is not in the target's reverse list
 RULE_BIT = {r: 1 << i for i, r in enumerate(RULE_NAMES)}
 EXACT_NAME_BITS = RULE_BIT["exact_name"] | RULE_BIT["core_name"] | RULE_BIT["name_key"]
 
@@ -74,6 +79,7 @@ DEFAULT_BLOCKING_PARAMS = {
     "max_df_frac": {"name": 0.01, "skel": 0.05, "addr": 0.01, "combo": 0.01},
     "n_features": 2 ** 20,
     "query_chunk": 20_000,
+    "reverse_k": 5,          # add each target's top reverse_k S1 (rival table) as candidates; 0 = off
     "n_jobs": 12,
     "use_gpu": True,   # GPU top-K retrieval (CuPy/cuSPARSE); CPU fallback on OOM
 }
@@ -85,7 +91,7 @@ OUTPUT_COLUMNS = [
     "target_addr", "target_city", "target_state", "target_house", "target_country", "target_native",
     "target_core_freq", "target_core_s1freq", "s1_core_s1freq",
     "other_s1_same_name_house", "other_s1_same_name_addr",
-    "name_cos", "skel_cos", "addr_cos", "combo_cos", "rule_mask", "rule", "block_score",
+    "name_cos", "skel_cos", "addr_cos", "combo_cos", "rule_mask", "rule", "block_score", "rev_rank",
 ]
 
 _NORM_COLS = ["entity_id", "country_normalized", "state_code", "city", "name_t", "name_core",
@@ -289,8 +295,42 @@ class TargetIndex:
         return T, idf
 
 
+def reverse_table(s1_norm: Path, target_norms: Dict[str, Path], label: str, country: str,
+                  params: dict, verbose: bool = True):
+    """(R, s1_entity_ids): each target's best S1 rows in the whole S1 file (context rival table, built
+    and cached on first use). None when reverse retrieval is disabled."""
+    if not params.get("reverse_k"):
+        return None
+    from src.context import CountryContext
+    ctx = CountryContext(s1_norm, target_norms, country, {k: v for k, v in params.items() if k != "ranker"},
+                         verbose)
+    R = ctx.target(label)["rivals"]["R"]
+    ids = ctx.s1.df["entity_id"].values
+    del ctx
+    gc.collect()
+    return R, ids
+
+
+def _reverse_pairs(s1: pd.DataFrame, rev, k: int):
+    """Reverse candidates restricted to the S1 rows being blocked: (q, t, rank) sorted by q."""
+    R, full_ids = rev
+    k = min(int(k), R.shape[1])
+    full_row = pd.Index(full_ids).get_indexer(s1["entity_id"].values)
+    q_of_full = np.full(len(full_ids), -1, dtype=np.int32)
+    ok = full_row >= 0
+    q_of_full[full_row[ok]] = np.nonzero(ok)[0].astype(np.int32)
+    s_all = R[:, :k].ravel()
+    t_all = np.repeat(np.arange(R.shape[0], dtype=np.int32), k)
+    r_all = np.tile(np.arange(k, dtype=np.int8), R.shape[0])
+    q_all = np.where(s_all >= 0, q_of_full[np.maximum(s_all, 0)], -1)
+    m = q_all >= 0
+    q, t, r = q_all[m], t_all[m], r_all[m]
+    order = np.argsort(q, kind="stable")
+    return q[order].astype(np.int64), t[order].astype(np.int64), r[order]
+
+
 def _block_source(s1: pd.DataFrame, idx: TargetIndex, params: dict,
-                  per_s1_cap: Optional[int] = None) -> pd.DataFrame:
+                  per_s1_cap: Optional[int] = None, rev=None) -> pd.DataFrame:
     """
     All candidate pairs (compact numeric form) for S1 rows against one target index.
     per_s1_cap keeps only each S1's top pairs by block_score within this source; the final
@@ -313,6 +353,10 @@ def _block_source(s1: pd.DataFrame, idx: TargetIndex, params: dict,
             gmats = {}
     chunk = params["query_chunk"]
     out_parts = []
+    guard = GpuGuard(max_failures=2)
+    rq = rt = rr = None
+    if rev is not None:
+        rq, rt, rr = _reverse_pairs(s1, rev, params.get("reverse_k", 5))
     starts = range(0, len(s1), chunk)
     it = pbar(starts, total=len(starts), desc=f"{idx.source_label}/{idx.country} top-K"
               f"{' (GPU)' if gmats else ' (CPU)'}", unit="chunk") if len(starts) > 1 else starts
@@ -328,11 +372,13 @@ def _block_source(s1: pd.DataFrame, idx: TargetIndex, params: dict,
             if f not in active:
                 continue
             rows_ = cols_ = None
-            if f in gmats:
+            g_ = gmats.get(f)
+            if g_ is not None:
                 try:
-                    rows_, cols_, _ = gpu_topn(Q_, gmats[f], params["topk"][f], params["cos_floor"])
-                except Exception:  # GPU out of memory even for one row -> CPU for this field/chunk
+                    rows_, cols_, _ = gpu_topn(Q_, g_, params["topk"][f], params["cos_floor"])
+                except Exception:  # GPU out of memory -> CPU for this field/chunk (and later chunks if repeated)
                     rows_ = None
+                    guard.failed(f, gmats)
             if rows_ is None:
                 C_ = sp_matmul_topn(Q_, T_, top_n=params["topk"][f], threshold=params["cos_floor"],
                                     n_threads=params["n_jobs"]).tocoo()
@@ -377,6 +423,18 @@ def _block_source(s1: pd.DataFrame, idx: TargetIndex, params: dict,
                 t_parts.append(cols.astype(np.int64))
                 b_parts.append(np.full(len(rows), RULE_BIT[f"knn_{f}"], dtype=np.int32))
 
+        # 3. Reverse retrieval (target -> S1) from the rival table
+        rk_key = rk_rank = None
+        if rq is not None:
+            lo, hi = np.searchsorted(rq, [c0, c0 + len(s1c)])
+            if hi > lo:
+                q_parts.append(rq[lo:hi] - c0)
+                t_parts.append(rt[lo:hi])
+                b_parts.append(np.full(hi - lo, RULE_BIT["rev_knn"], dtype=np.int32))
+                rk_key = (rq[lo:hi] - c0) * nT + rt[lo:hi]
+                o = np.argsort(rk_key)
+                rk_key, rk_rank = rk_key[o], rr[lo:hi][o]
+
         if not q_parts:
             continue
         q = np.concatenate(q_parts)
@@ -391,6 +449,12 @@ def _block_source(s1: pd.DataFrame, idx: TargetIndex, params: dict,
         q, t = ukey // nT, ukey % nT
 
         part = {"qi": (q + c0).astype(np.int64), "tj": t.astype(np.int64), "rule_mask": mask.astype(np.int32)}
+        rev_rank = np.full(len(ukey), REV_MISSING_RANK, dtype=np.int8)
+        if rk_key is not None and len(rk_key):
+            pos = np.minimum(np.searchsorted(rk_key, ukey), len(rk_key) - 1)
+            hit = rk_key[pos] == ukey
+            rev_rank[hit] = rk_rank[pos[hit]]
+        part["rev_rank"] = rev_rank
         for f in FIELDS:
             part[f"{f}_cos"] = _rowdot(Qs[f], mats[f][0], q, t)
         s1_addr_empty = (s1c["addr_t"].str.len().values == 0)
@@ -402,6 +466,11 @@ def _block_source(s1: pd.DataFrame, idx: TargetIndex, params: dict,
                         .groupby("qi", sort=False).head(per_s1_cap)
                         .drop(columns="_cap").reset_index(drop=True))
         out_parts.append(part)
+        # release this chunk's temporaries before the next one (RAM + cached GPU blocks)
+        del Qs, found, q_parts, t_parts, b_parts, q, t, b, key, order, mask, ukey, part
+        free_gpu()
+        if ci % 5 == 4:
+            gc.collect()
 
     prefetch.shutdown(wait=True)
     for g in gmats.values():
@@ -438,16 +507,18 @@ def block_score(df: pd.DataFrame) -> np.ndarray:
 # ------------------------------------------------------------------------------
 # Learned blocking ranker: decides which candidates survive the per-S1 cap
 # ------------------------------------------------------------------------------
-RANKER_FEATURES = (["name_cos", "skel_cos", "addr_cos", "combo_cos", "addr_missing", "heuristic"]
+RANKER_FEATURES = (["name_cos", "skel_cos", "addr_cos", "combo_cos", "addr_missing", "heuristic", "rev_rank"]
                    + [f"bit_{r}" for r in RULE_NAMES])
 
 
 def ranker_matrix(df: pd.DataFrame) -> np.ndarray:
     cols = [df[f"{f}_cos"].values.astype(np.float32) for f in FIELDS]
     miss = (df["addr_missing"].values if "addr_missing" in df.columns else np.zeros(len(df))).astype(np.float32)
+    rrank = (df["rev_rank"].values if "rev_rank" in df.columns
+             else np.full(len(df), REV_MISSING_RANK)).astype(np.float32)
     mask = df["rule_mask"].values
     bits = [((mask & RULE_BIT[r]) != 0).astype(np.float32) for r in RULE_NAMES]
-    return np.column_stack(cols + [miss, block_score(df)] + bits).astype(np.float32)
+    return np.column_stack(cols + [miss, block_score(df), rrank] + bits).astype(np.float32)
 
 
 class BlockRanker:
@@ -462,6 +533,7 @@ class BlockRanker:
         self.device = device
         self.model = None
         self.topk = dict(topk or {})   # retrieval config it was trained under
+        self.features = list(RANKER_FEATURES)  # feature layout it was trained on
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         import xgboost as xgb
@@ -615,6 +687,8 @@ def _materialize(pairs: pd.DataFrame, s1: pd.DataFrame, targets: Dict[str, pd.Da
         res[f"{f}_cos"] = pairs[f"{f}_cos"].values
     res["rule_mask"] = pairs["rule_mask"].values
     res["block_score"] = pairs["block_score"].values
+    res["rev_rank"] = (pairs["rev_rank"].values if "rev_rank" in pairs.columns
+                       else np.full(len(pairs), REV_MISSING_RANK, dtype=np.int8))
     out = pd.DataFrame(res)
     out["s1_native"] = out["s1_native"].astype(np.int8)
     out["target_native"] = out["target_native"].astype(np.int8)
@@ -669,8 +743,10 @@ def iter_candidate_pairs(
         targets, pair_parts = {}, []
         for label, tpath in target_norms:
             ts = time.time()
+            rev = reverse_table(s1_norm, dict(target_norms), label, country, p, verbose)
             idx = TargetIndex(tpath, label, country, p, verbose)
-            pairs = _block_source(s1, idx, p, per_s1_cap=max_candidates_per_s1)
+            pairs = _block_source(s1, idx, p, per_s1_cap=max_candidates_per_s1, rev=rev)
+            del rev
             if len(pairs):
                 # Keep only referenced target rows (bounds memory) and remap indices
                 used = np.unique(pairs["tj"].values)
@@ -738,7 +814,8 @@ def blocking_signature(s1_ids: List[str], max_candidates_per_s1: Optional[int], 
         "norm_version": NORM_VERSION,
         "key_cols_version": KEY_COLS_VERSION,
         "rules": RULE_NAMES,
-        "params": {k: params[k] for k in ("topk", "cos_floor", "key_freq_cap", "max_df_frac", "n_features")},
+        "params": {k: params.get(k) for k in ("topk", "cos_floor", "key_freq_cap", "max_df_frac", "n_features",
+                                              "reverse_k")},
     }
     if ranker_path is not None and Path(ranker_path).is_file():
         st = Path(ranker_path).stat()
@@ -816,8 +893,10 @@ def block_to_checkpoints(
                     print(f"    S1 -> {label} ({country}): resumed {len(pairs):,} pairs from checkpoint")
             else:
                 ts = time.time()
+                rev = reverse_table(s1_norm, dict(target_norms), label, country, p, verbose)
                 idx = TargetIndex(tpath, label, country, p, verbose)
-                pairs = _block_source(s1, idx, p, per_s1_cap=max_candidates_per_s1)
+                pairs = _block_source(s1, idx, p, per_s1_cap=max_candidates_per_s1, rev=rev)
+                del rev
                 if len(pairs):
                     used = np.unique(pairs["tj"].values)
                     tdf = idx.df.iloc[used].drop(
@@ -900,14 +979,16 @@ def collect_raw_pairs(
         f"SELECT DISTINCT n.country_normalized FROM '{f}' n JOIN sel_ids s ON n.entity_id = s.entity_id "
         f"WHERE n.country_normalized != '' ORDER BY 1").fetchall()]
     con.close()
-    keep = ["name_cos", "skel_cos", "addr_cos", "combo_cos", "addr_missing", "rule_mask"]
+    keep = ["name_cos", "skel_cos", "addr_cos", "combo_cos", "addr_missing", "rule_mask", "rev_rank"]
     parts = []
     for country in countries:
         s1 = _load_norm(s1_norm, country, ids_df).reset_index(drop=True)
         for label, tpath in target_norms:
             ts = time.time()
+            rev = reverse_table(s1_norm, dict(target_norms), label, country, p, verbose)
             idx = TargetIndex(tpath, label, country, p, verbose)
-            pairs = _block_source(s1, idx, p, per_s1_cap=None)
+            pairs = _block_source(s1, idx, p, per_s1_cap=None, rev=rev)
+            del rev
             if len(pairs):
                 out = pairs[keep].copy()
                 out["s1_id"] = s1["entity_id"].values[pairs["qi"].values]

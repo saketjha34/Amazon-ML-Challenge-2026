@@ -21,6 +21,14 @@ Two country-agnostic feature families, learned only from the provided data:
    own name / address evidence). S1 is deduplicated, so a better-matching rival means the target
    most likely belongs to the rival. Computed identically on train, validation and test.
 
+3. Target duplicate structure (v4). Distractor records (targets that belong to no S1 business) are
+   single perturbed copies: in the training ground truth only 1.2% of them share (name key, house number)
+   with another S2/S3 record and 4.6% share the exact address, vs 32% / 43% of real records (a business
+   usually has several S2/S3 records). The test set has ~2x more distractors per S1 than training, so
+   "this candidate has no duplicate anywhere" is the signal that separates a look-alike distractor
+   ("807 Heights Blvd" vs "1001 Heights Blvd") from a real record. Counted over all S2 + S3 records of
+   the country (no labels involved), cached once per dataset.
+
 All heavy artefacts are cached under dataset/norm/ctx/ and reused by every run.
 """
 
@@ -39,11 +47,13 @@ from sklearn.feature_extraction.text import HashingVectorizer
 from sparse_dot_topn import sp_matmul_topn
 
 from src.blocking import TargetIndex, _apply_tfidf, _field_text, _hash_counts, _resolve_params
-from src.gpu_topk import GPU_AVAILABLE, GpuTargetMatrix, gpu_topn
+from src.gpu_topk import GPU_AVAILABLE, GpuGuard, GpuTargetMatrix, free_gpu, gpu_topn
 from src.progress import pbar
 from src.text_norm import NORM_VERSION, ensure_norm
 
-CTX_VERSION = 3
+CTX_VERSION = 4       # pair-feature version (v4: target duplicate counts)
+RIVAL_VERSION = 3     # rival-table cache version (unchanged by v4: cached tables stay valid)
+DUP_VERSION = 1
 WORD_VERSION = 3      # word-matrix cache version (independent of the rival algorithm version)
 RIVAL_K = 10          # reverse retrieval depth (char 3-gram cosine on name + address)
 RIVAL_KEEP = 5        # rivals kept per target after idf re-scoring
@@ -60,6 +70,11 @@ CONTEXT_COLUMNS = [
     "ctx_own_score", "rv_has_rival", "rv_best_score", "rv_margin", "rv_best_nm", "rv_best_ad",
     "rv_best_house", "rv_n_better", "rv_n_close",
 ]
+# Other S2/S3 records of the same country sharing a key with the candidate (NaN when the key is empty):
+# (name key, house no.), exact address, (name key, city), (name skeleton, house no.), and the same two
+# first keys counted in the other source only.
+DUP_COLUMNS = ["t_dup_nkh", "t_dup_addr", "t_dup_nkc", "t_dup_skh", "t_dup_xs_nkh", "t_dup_xs_addr"]
+CONTEXT_COLUMNS = CONTEXT_COLUMNS + DUP_COLUMNS
 
 # Light extra address cleanup for token evidence (French numbering: "N 26" -> anyascii "ndeg",
 # "30 bis" / "30bis" / "30 ter" -> "30").
@@ -190,13 +205,76 @@ class CountryContext:
         self.ridf_a = np.where(df_a > WORD_RETRIEVAL_MAX_DF * n, 0.0, self.idf_a).astype(np.float32)
         self.target_norms = dict(target_norms)
         self._targets: Dict[str, dict] = {}
+        self._dup_df: Optional[pd.DataFrame] = None
+
+    # ---------------------------------------------------------------- target duplicate counts
+    def _dup_table(self) -> pd.DataFrame:
+        """Duplicate counts for every S2/S3 record of this country (cached parquet, built with DuckDB)."""
+        if self._dup_df is not None:
+            return self._dup_df
+        norms = [self.target_norms[k] for k in ("S2", "S3") if k in self.target_norms]
+        stems = "__".join(Path(p).stem for p in norms)
+        path = self.cache_dir / f"tdup__{stems}__{self.country}__v{DUP_VERSION}.parquet"
+        if not path.is_file():
+            import duckdb
+            t0 = time.time()
+            con = duckdb.connect()
+            from src.resources import cpu_threads
+            con.execute(f"PRAGMA threads={cpu_threads()}")
+            sel = " UNION ALL ".join(
+                f"SELECT entity_id, '{k}' AS src, coalesce(name_key,'') nk, coalesce(name_skel,'') sk, "
+                f"coalesce(house_c,'') hc, coalesce(addr_t,'') ad, coalesce(city,'') ci "
+                f"FROM '{str(p).replace(chr(92), '/')}' WHERE country_normalized = $c"
+                for k, p in zip(("S2", "S3"), norms))
+            df = con.execute(f"""
+                WITH t AS ({sel}), k AS (
+                  SELECT entity_id, src,
+                    CASE WHEN nk <> '' AND hc <> '' THEN nk || '|' || hc END k_nkh,
+                    CASE WHEN ad <> '' THEN ad END k_addr,
+                    CASE WHEN nk <> '' AND ci <> '' THEN nk || '|' || ci END k_nkc,
+                    CASE WHEN sk <> '' AND hc <> '' THEN sk || '|' || hc END k_skh
+                  FROM t)
+                SELECT entity_id,
+                  CASE WHEN k_nkh IS NULL THEN NULL ELSE count(*) OVER (PARTITION BY k_nkh) - 1 END t_dup_nkh,
+                  CASE WHEN k_addr IS NULL THEN NULL ELSE count(*) OVER (PARTITION BY k_addr) - 1 END t_dup_addr,
+                  CASE WHEN k_nkc IS NULL THEN NULL ELSE count(*) OVER (PARTITION BY k_nkc) - 1 END t_dup_nkc,
+                  CASE WHEN k_skh IS NULL THEN NULL ELSE count(*) OVER (PARTITION BY k_skh) - 1 END t_dup_skh,
+                  CASE WHEN k_nkh IS NULL THEN NULL ELSE count(*) OVER (PARTITION BY k_nkh)
+                       - count(*) OVER (PARTITION BY k_nkh, src) END t_dup_xs_nkh,
+                  CASE WHEN k_addr IS NULL THEN NULL ELSE count(*) OVER (PARTITION BY k_addr)
+                       - count(*) OVER (PARTITION BY k_addr, src) END t_dup_xs_addr
+                FROM k""", {"c": self.country}).df()
+            con.close()
+            for c in DUP_COLUMNS:
+                df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
+            tmp = path.with_suffix(".tmp.parquet")
+            df.to_parquet(tmp, index=False)
+            tmp.replace(path)
+            if self.verbose:
+                print(f"      [Context] duplicate counts {self.country}: {len(df):,} targets in {time.time() - t0:.1f}s")
+        self._dup_df = pd.read_parquet(path)
+        return self._dup_df
+
+    def _dups_for(self, side: _Side) -> Dict[str, np.ndarray]:
+        dt = self._dup_table()
+        pos = pd.Index(dt["entity_id"].values).get_indexer(side.df["entity_id"].values)
+        ok = pos >= 0
+        out = {}
+        for c in DUP_COLUMNS:
+            v = np.full(side.n, np.nan, dtype=np.float32)
+            v[ok] = dt[c].to_numpy(dtype=np.float32, na_value=np.nan)[pos[ok]]
+            out[c] = v
+        return out
 
     # ---------------------------------------------------------------- targets + rival tables
     def target(self, label: str) -> dict:
         if label not in self._targets:
             idx = TargetIndex(self.target_norms[label], label, self.country, self.p, self.verbose)
             side = _Side(idx, self.cache_dir, self.verbose)
-            self._targets[label] = {"side": side, "rivals": self._rivals(label, idx, side)}
+            self._targets[label] = {"side": side, "rivals": self._rivals(label, idx, side),
+                                    "dups": self._dups_for(side)}
+            if all(k in self._targets for k in ("S2", "S3") if k in self.target_norms):
+                self._dup_df = None   # both sides aligned: the country table is no longer needed
         return self._targets[label]
 
     def release(self, label: str) -> None:
@@ -204,7 +282,7 @@ class CountryContext:
         gc.collect()
 
     def _rivals(self, label: str, idx: TargetIndex, side: _Side) -> Dict[str, np.ndarray]:
-        tag = _sig(CTX_VERSION, NORM_VERSION, RIVAL_K, RIVAL_KEEP, RIVAL_FLOOR, self.p["max_df_frac"],
+        tag = _sig(RIVAL_VERSION, NORM_VERSION, RIVAL_K, RIVAL_KEEP, RIVAL_FLOOR, self.p["max_df_frac"],
                    self.p["n_features"], self.s1.n)
         path = self.cache_dir / (f"rivals__{idx.norm_path.stem}__vs__{self.s1_idx.norm_path.stem}"
                                  f"__{self.country}__{tag}.npz")
@@ -233,6 +311,7 @@ class CountryContext:
                     g.free()
                 G = {}
         starts = list(range(0, nT, RIVAL_QUERY_CHUNK))
+        guard = GpuGuard(max_failures=2)
         for c0 in pbar(starts, total=len(starts), desc=f"rivals {label}/{self.country}"
                        f"{' (GPU)' if G else ' (CPU)'}", unit="chunk"):
             tdf = idx.df.iloc[c0:c0 + RIVAL_QUERY_CHUNK]
@@ -247,8 +326,9 @@ class CountryContext:
                 if view in G:
                     try:
                         rows, cols, _ = gpu_topn(Q, G[view], RIVAL_K, RIVAL_FLOOR)
-                    except Exception:
+                    except Exception:   # GPU out of memory -> CPU for this chunk (and later ones if repeated)
                         rows = None
+                        guard.failed(view, G)
                 if rows is None:
                     C = sp_matmul_topn(Q, index[view], top_n=RIVAL_K, threshold=RIVAL_FLOOR,
                                        n_threads=self.p["n_jobs"]).tocoo()
@@ -276,6 +356,8 @@ class CountryContext:
             NM[tr, rk] = np.nan_to_num(nm[keep])
             AD[tr, rk] = np.nan_to_num(ad[keep])
             H[tr, rk] = he[keep].astype(np.int8)
+            del queries, r_parts, c_parts, rows, cols, t_rows, nm, ad, he, sc, order, first, rank, keep, tr, rk
+            free_gpu()
         for g in G.values():
             g.free()
         out = {"R": R, "S": S, "NM": NM, "AD": AD, "H": H}
@@ -297,7 +379,7 @@ class CountryContext:
             if not len(sel_idx) or label not in self.target_norms:
                 continue
             tg = self.target(label)
-            side, rv = tg["side"], tg["rivals"]
+            side, rv, dups = tg["side"], tg["rivals"], tg["dups"]
             tr_all = side.row_of.get_indexer(cand_ids[sel_idx])
             ok = tr_all >= 0
             sel_idx, tr_all = sel_idx[ok], tr_all[ok]
@@ -327,6 +409,8 @@ class CountryContext:
                 out["rv_best_house"][ii] = np.where(has, rv["H"][tr][ar, first], 0).astype(np.float32)
                 out["rv_n_better"][ii] = ((S > own[:, None] + 1e-6) & valid).sum(axis=1).astype(np.float32)
                 out["rv_n_close"][ii] = ((S >= own[:, None] - 0.05) & valid).sum(axis=1).astype(np.float32)
+                for c in DUP_COLUMNS:
+                    out[c][ii] = dups[c][tr]
         return pd.DataFrame(out)
 
 

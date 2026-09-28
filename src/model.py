@@ -107,11 +107,12 @@ class EntityMatcherModel:
         else:
             raise ValueError(f"Unknown model_type: {self.model_type}")
 
-    def train(self, X_train: pd.DataFrame, y_train: pd.Series):
-        """Train classifier on pairwise features."""
+    def train(self, X_train: pd.DataFrame, y_train: pd.Series, sample_weight: Optional[np.ndarray] = None):
+        """Train classifier on pairwise features (optional per-row sample weights)."""
         self.feature_names = list(X_train.columns)
         X_mat = np.ascontiguousarray(X_train.values, dtype=np.float32)
         y_vec = np.ascontiguousarray(y_train.values, dtype=np.int32)
+        w = None if sample_weight is None else np.ascontiguousarray(sample_weight, dtype=np.float32)
 
         if self.model_type == "ensemble":
             from concurrent.futures import ThreadPoolExecutor
@@ -119,15 +120,15 @@ class EntityMatcherModel:
                   f"{len(X_train):,} pairs with {len(X_train.columns)} features...")
             # Both libraries release the GIL while fitting, so GPU and CPU train at the same time
             with ThreadPoolExecutor(max_workers=2) as ex:
-                f_xgb = ex.submit(self.model["xgb"].fit, X_mat, y_vec)
-                f_lgb = ex.submit(self.model["lgb"].fit, X_train, y_train)
+                f_xgb = ex.submit(self.model["xgb"].fit, X_mat, y_vec, sample_weight=w)
+                f_lgb = ex.submit(self.model["lgb"].fit, X_train, y_train, sample_weight=w)
                 f_xgb.result()
                 f_lgb.result()
             print("    [Model] ENSEMBLE training complete.")
         else:
             backend_info = f"XGBoost on GPU ({self.device})" if self.model_type == "xgboost" and self.device == "cuda" else f"{self.model_type.upper()} on CPU"
             print(f"    [Model] Training {backend_info} on {len(X_train):,} pairs with {len(X_train.columns)} features...")
-            self.model.fit(X_mat, y_vec)
+            self.model.fit(X_mat, y_vec, sample_weight=w)
             print(f"    [Model] {self.model_type.upper()} training complete.")
 
         self.is_trained = True

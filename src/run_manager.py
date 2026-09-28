@@ -110,10 +110,17 @@ class RunManager:
             if dst.exists():
                 return False
             dst.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.link(src, dst)            # same NTFS volume: instant, no extra disk space
-            except OSError:
-                shutil.copy2(src, dst)       # keeps mtime (blocking checkpoints fingerprint the ranker file)
+            # Only large write-once data files are hard-linked (instant, no extra disk). Everything that
+            # can be rewritten in place (models, ids, signature.json, _DONE) is copied: rewriting a hard
+            # link would silently change the source run too. copy2 keeps the mtime, which the blocking
+            # checkpoint fingerprint uses for the ranker file.
+            if src.suffix in (".parquet", ".npz"):
+                try:
+                    os.link(src, dst)
+                    return True
+                except OSError:
+                    pass
+            shutil.copy2(src, dst)
             return True
 
         n = 0

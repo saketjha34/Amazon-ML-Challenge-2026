@@ -51,6 +51,14 @@ class PipelineConfig:
     # Set to an integer (e.g., 5000, 10000, 50000) for rapid testing/experimentation.
     # Set to None to run on the ENTIRE dataset.
     SAMPLE_SIZE_S1: Optional[int] = None
+    # None = the first SAMPLE_SIZE_S1 S1 by entity_id (how run_100k_v1/v2 were sampled).
+    # An integer = a random sample drawn with this seed from the whole S1 file (--sample-seed).
+    SAMPLE_SEED: Optional[int] = None
+    # Runs whose train + validation S1 are excluded from this run's sample (--exclude-runs), which makes
+    # samples disjoint so the runs can be ensembled without leaking each other's validation data.
+    SAMPLE_EXCLUDE_RUNS: List[str] = field(default_factory=list)
+    # Other runs whose models are averaged with this run's models in val / test (--ensemble-with).
+    ENSEMBLE_RUNS: List[str] = field(default_factory=list)
 
     # Candidates kept per S1 (across S2+S3), ranked by blocking similarity score
     MAX_CANDIDATES_PER_S1: int = 80
@@ -74,6 +82,9 @@ class PipelineConfig:
         "max_df_frac": {"name": 0.01, "skel": 0.05, "addr": 0.01, "combo": 0.01},
         "n_features": 2 ** 20,
         "query_chunk": 20_000,
+        # Reverse retrieval: each target's best reverse_k S1 businesses (context rival table) are added
+        # as candidates. Recovers ~31% of the true links plain S1->target retrieval never finds.
+        "reverse_k": 5,
         "n_jobs": None,          # None = use --cpu-threads (src/resources.py)
         "use_gpu": True,         # top-K retrieval on the GPU (CuPy/cuSPARSE); --cpu-blocking to disable
     })
@@ -157,6 +168,13 @@ class PipelineConfig:
     # None = choose thresholds that maximize Macro F0.5 (the leaderboard metric).
     # A value such as 0.975 = choose the thresholds with the highest recall whose precision >= it.
     MIN_PRECISION: Optional[float] = None
+    # Test-calibrated thresholds: the (t1, t2) sweep maximizes Macro F0.5 with every false match counted
+    # this many times (leaderboard probes on run_100k_v2: stricter-than-validation thresholds scored
+    # 0.957 / 0.9597 vs 0.953). 1.0 = plain validation optimum (also reported in metrics.json).
+    THRESHOLD_FP_WEIGHT: float = 2.0
+    # Training weight of negatives whose target belongs to no S1 business (distractors): test has ~40%
+    # such targets vs 26% in training -> odds ratio ~1.9. 1.0 = off.
+    ORPHAN_NEG_WEIGHT: float = 1.9
 
     # --------------------------------------------------------------------------
     # 10. STAGE-2 STACKING (re-score candidates using sibling candidates of the same S1)

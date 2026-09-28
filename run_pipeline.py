@@ -53,7 +53,7 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["train", "val", "test", "all"],
+        choices=["train", "val", "test", "all", "decide"],
         default="all",
         help="Pipeline mode to run: 'train', 'val', 'test', or 'all' (default: all)",
     )
@@ -177,9 +177,51 @@ def main():
         help="Reuse blocking / features / test-blocking checkpoints of another run folder (e.g. run_100k_v1)",
     )
     parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=None,
+        help="Draw --sample-size S1 at random with this seed (default: the first N by entity_id)",
+    )
+    parser.add_argument(
+        "--exclude-runs",
+        type=str,
+        default=None,
+        help="Comma-separated runs whose train+val S1 are excluded from this sample (disjoint samples)",
+    )
+    parser.add_argument(
+        "--ensemble-with",
+        type=str,
+        default=None,
+        help="Comma-separated runs whose models are averaged with this run's models (val and test)",
+    )
+    parser.add_argument(
         "--no-context",
         action="store_true",
         help="Disable rival-S1 / distinctive-token context features",
+    )
+    parser.add_argument(
+        "--fp-weight",
+        type=float,
+        default=None,
+        help="Threshold choice counts each false match this many times (default 2.0; 1.0 = validation optimum)",
+    )
+    parser.add_argument(
+        "--orphan-weight",
+        type=float,
+        default=None,
+        help="Training weight of negatives on targets owned by no S1 (default 1.9; 1.0 = off)",
+    )
+    parser.add_argument(
+        "--t1",
+        type=float,
+        default=None,
+        help="--mode decide: threshold for each S1's top candidate",
+    )
+    parser.add_argument(
+        "--t2",
+        type=float,
+        default=None,
+        help="--mode decide: threshold for the other candidates",
     )
     parser.add_argument(
         "--threshold",
@@ -222,6 +264,16 @@ def main():
         cfg.USE_STACKING = False
     if args.no_context:
         cfg.USE_CONTEXT = False
+    if args.fp_weight is not None:
+        cfg.THRESHOLD_FP_WEIGHT = args.fp_weight
+    if args.orphan_weight is not None:
+        cfg.ORPHAN_NEG_WEIGHT = args.orphan_weight
+    if args.sample_seed is not None:
+        cfg.SAMPLE_SEED = args.sample_seed
+    if args.exclude_runs:
+        cfg.SAMPLE_EXCLUDE_RUNS = [r.strip() for r in args.exclude_runs.split(",") if r.strip()]
+    if args.ensemble_with:
+        cfg.ENSEMBLE_RUNS = [r.strip() for r in args.ensemble_with.split(",") if r.strip()]
     if args.oof_folds is not None:
         cfg.STACK_OOF_FOLDS = args.oof_folds
     if args.min_precision is not None:
@@ -289,6 +341,10 @@ def main():
         pipeline.run_val(force_recompute=args.force_recompute)
     elif args.mode == "test":
         pipeline.run_test(threshold=args.threshold, force_recompute=args.force_recompute)
+    elif args.mode == "decide":
+        if args.t1 is None or args.t2 is None:
+            parser.error("--mode decide needs --t1 and --t2")
+        pipeline.run_decide(args.t1, args.t2)
 
 
 if __name__ == "__main__":

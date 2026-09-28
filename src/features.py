@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.process import cpdist
+from rapidfuzz.distance import JaroWinkler
 
 from src.blocking import RULE_NAMES, RULE_BIT
 from src.progress import pbar
@@ -47,6 +48,7 @@ _BATCH_COLS = [
     "target_core_freq", "target_core_s1freq", "s1_core_s1freq",
     # competing-S1 signals (see src/blocking.py: _competitor_flags)
     "other_s1_same_name_house", "other_s1_same_name_addr",
+    "rev_rank",
 ]
 
 _FUZZ = [
@@ -82,9 +84,44 @@ FEATURE_COLUMNS = (
         "target_core_logfreq", "rare_name_evidence",
         "s1freq_target_name_log", "s1freq_own_name_log", "name_share_prior",
         "other_s1_same_name_house", "other_s1_same_name_addr",
+        "rev_rank",
+        # legal-form agreement (LLC vs Inc learned on US/India transfers to SARL vs SAS in France)
+        "legal_match", "legal_conflict", "legal_one_empty",
+        "core_jw", "name_jw",
     ]
     + [f"rule_{r}" for r in RULE_NAMES]
 )
+
+
+# Legal forms grouped into equivalence classes (words as they appear in the normalized name_t)
+_LEGAL_GROUP = {
+    "llc": "llc", "inc": "inc", "incorporated": "inc", "corp": "corp", "corporation": "corp",
+    "ltd": "ltd", "limited": "ltd", "pvt": "pvt", "private": "pvt", "co": "co", "company": "co",
+    "llp": "llp", "lp": "lp", "pc": "pc", "pllc": "pllc", "plc": "plc", "opc": "opc",
+    "sarl": "sarl", "sas": "sas", "sasu": "sasu", "sa": "sa", "sci": "sci", "eurl": "eurl", "snc": "snc",
+    "scp": "scp", "selarl": "selarl", "cie": "cie", "ei": "ei",
+}
+
+
+def _legal_set(name_t: str) -> frozenset:
+    return frozenset(_LEGAL_GROUP[t] for t in name_t.split() if t in _LEGAL_GROUP)
+
+
+def _legal_stats(left, right):
+    n = len(left)
+    match = np.zeros(n, np.float32)
+    conflict = np.zeros(n, np.float32)
+    one_empty = np.zeros(n, np.float32)
+    for i in range(n):
+        a, b = _legal_set(left[i]), _legal_set(right[i])
+        if a and b:
+            if a == b:
+                match[i] = 1.0
+            elif not (a & b):
+                conflict[i] = 1.0
+        elif a or b:
+            one_empty[i] = 1.0
+    return match, conflict, one_empty
 
 
 def _nonempty(a: np.ndarray) -> np.ndarray:
@@ -302,6 +339,14 @@ class FeatureExtractor:
         f.update(house_edit_sim=h_edit, house_num_reldiff=h_rel, house_prefix=h_pre)
         f["num_fuzzy"] = _num_fuzzy(cols["s1_addr"], cols["target_addr"])
 
+        lm, lc, lo = _legal_stats(cols["s1_name"], cols["target_name"])
+        f.update(legal_match=lm, legal_conflict=lc, legal_one_empty=lo)
+        for fname, lc_, rc_ in (("core_jw", "s1_core", "target_core"), ("name_jw", "s1_name", "target_name")):
+            a, b = cols[lc_], cols[rc_]
+            v = cpdist(list(a), list(b), scorer=JaroWinkler.normalized_similarity,
+                       workers=self.workers or cpu_threads(), dtype=np.float32)
+            f[fname] = np.where(_nonempty(a) & _nonempty(b), v, 0.0).astype(np.float32)
+
         # Space-free name comparison: "easternheartlandhealth com" vs "eastern heartland health"
         a_ns = [x.replace(" ", "") for x in cols["s1_core"]]
         b_ns = [x.replace(" ", "") for x in cols["target_core"]]
@@ -343,6 +388,9 @@ class FeatureExtractor:
         for c in ["name_cos", "skel_cos", "addr_cos", "combo_cos", "block_score"]:
             f[c] = df[c].values.astype(np.float32)
         f["is_source3"] = (df["candidate_source"].values == "S3").astype(np.float32)
+        # position of this S1 in the target's reverse (target -> whole S1 file) list; 9 = not in it
+        f["rev_rank"] = (df["rev_rank"].values.astype(np.float32) if "rev_rank" in df.columns
+                         else np.full(len(df), 9.0, dtype=np.float32))
         f["target_native"] = df["target_native"].values.astype(np.float32)
         mask = df["rule_mask"].values
         for r in RULE_NAMES:

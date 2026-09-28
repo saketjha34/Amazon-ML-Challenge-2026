@@ -53,6 +53,8 @@ def split_s1_entities(
     val_ratio: float = 0.30,
     random_seed: int = 42,
     sample_size: Optional[int] = None,
+    sample_seed: Optional[int] = None,
+    exclude_ids: Optional[set] = None,
 ) -> Tuple[List[str], List[str]]:
     """
     Perform a strict Source 1 Entity-Level Split (default 70-30).
@@ -62,7 +64,16 @@ def split_s1_entities(
     Returns:
       (train_s1_ids, val_s1_ids)
     """
-    all_ids = get_all_s1_ids(s1_parquet_path, limit=sample_size)
+    if sample_seed is None and not exclude_ids:
+        all_ids = get_all_s1_ids(s1_parquet_path, limit=sample_size)   # first N by entity_id (legacy)
+    else:
+        # Random sample of N S1 from the whole file, optionally excluding S1 used by other runs, so
+        # several runs can be trained on disjoint samples and ensembled (--sample-seed / --exclude-runs).
+        pool = get_all_s1_ids(s1_parquet_path)
+        if exclude_ids:
+            pool = [i for i in pool if i not in exclude_ids]
+        pool_rng = random.Random(1000003 + (sample_seed or 0))
+        all_ids = pool_rng.sample(pool, min(sample_size, len(pool))) if sample_size else pool
     
     rng = random.Random(random_seed)
     shuffled_ids = list(all_ids)

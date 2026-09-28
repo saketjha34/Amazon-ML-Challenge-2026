@@ -33,7 +33,9 @@ except Exception:  # pragma: no cover - no CUDA / CuPy
     GPU_AVAILABLE = False
     _CUDA_ERRORS = (MemoryError,)
 
-MAX_BATCH_ROWS = 2048
+MAX_BATCH_ROWS = 1024
+MAX_OOM_RETRIES = 4             # after this many GPU failures in one call -> MemoryError -> CPU fallback
+_BUDGET_SCALE = [1.0]           # adaptive: halved after every GPU failure, recovers slowly on success
 BYTES_PER_PRODUCT = 24          # conservative: SpGEMM intermediates + output (value, index, row)
 MAX_WORK_PER_BATCH = 150_000_000
 
@@ -41,8 +43,37 @@ MAX_WORK_PER_BATCH = 150_000_000
 def _free_pool():
     try:
         cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
     except Exception:
         pass
+
+
+def free_gpu() -> None:
+    """Release every cached CuPy block (call after each chunk so the next one starts clean)."""
+    if cp is not None:
+        _free_pool()
+
+
+class GpuGuard:
+    """
+    Per-index GPU health: after `max_failures` out-of-memory fallbacks, the index is moved off the GPU
+    for the rest of the pass (its device memory released) instead of failing again on every chunk.
+    """
+
+    def __init__(self, max_failures: int = 2):
+        self.max_failures = max_failures
+        self.failures = {}
+
+    def failed(self, key, gmats: dict) -> None:
+        self.failures[key] = self.failures.get(key, 0) + 1
+        if self.failures[key] >= self.max_failures and key in gmats:
+            g = gmats.pop(key)
+            try:
+                g.free()
+            except Exception:
+                pass
+            _free_pool()
+            print(f"      [GPU] '{key}' moved to CPU for the rest of this pass (GPU memory is too tight)")
 
 
 def _work_budget() -> int:
@@ -50,7 +81,8 @@ def _work_budget() -> int:
     try:
         _free_pool()
         free, _ = cp.cuda.runtime.memGetInfo()
-        return int(max(1_000_000, min(MAX_WORK_PER_BATCH, 0.35 * free / BYTES_PER_PRODUCT)))
+        return int(max(500_000, min(MAX_WORK_PER_BATCH,
+                                    0.25 * free * _BUDGET_SCALE[0] / BYTES_PER_PRODUCT)))
     except Exception:
         return 10_000_000
 
@@ -116,14 +148,17 @@ def gpu_topn(Q: sp.csr_matrix, G: GpuTargetMatrix, top_n: int, threshold: float,
     Q.sort_indices()
     rows_out, cols_out, vals_out = [], [], []
     stack = list(reversed(_plan_batches(Q, G.feat_df, _work_budget())))
+    fails = 0
     while stack:
         a, b = stack.pop()
         try:
             res = _topn_batch(Q[a:b], G, top_n, threshold, a)
         except Exception:  # any CUDA / cuSPARSE allocation failure: split and retry
             _free_pool()
-            if b - a <= 1:
-                raise MemoryError("GPU top-K: a single query row does not fit in GPU memory")
+            fails += 1
+            _BUDGET_SCALE[0] = max(0.05, _BUDGET_SCALE[0] * 0.5)   # plan smaller batches from now on
+            if b - a <= 1 or fails > MAX_OOM_RETRIES:
+                raise MemoryError("GPU top-K: out of GPU memory, falling back to CPU for this chunk")
             mid = (a + b) // 2
             stack.extend([(mid, b), (a, mid)])   # retry both halves (a..mid first)
             continue
@@ -132,6 +167,8 @@ def gpu_topn(Q: sp.csr_matrix, G: GpuTargetMatrix, top_n: int, threshold: float,
             cols_out.append(res[1])
             vals_out.append(res[2])
     _free_pool()
+    if not fails:
+        _BUDGET_SCALE[0] = min(1.0, _BUDGET_SCALE[0] * 1.1)
     if not rows_out:
         e = np.zeros(0, dtype=np.int64)
         return e, e, np.zeros(0, dtype=np.float32)

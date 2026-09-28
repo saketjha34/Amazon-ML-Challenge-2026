@@ -26,7 +26,8 @@ import pyarrow.parquet as pq
 from anyascii import anyascii
 
 # Bump when normalization changes: invalidates the normalized parquet and TF-IDF caches.
-NORM_VERSION = 2
+# v3: learned transliteration dictionary for native-script names (see build_translit_dict).
+NORM_VERSION = 3
 
 NORM_COLUMNS = [
     "entity_id", "country_normalized", "state_code", "city",
@@ -143,6 +144,92 @@ def _prep_name(raw: str) -> str:
     return _SPACES.sub(" ", s).strip()
 
 
+# ------------------------------------------------------------------------------
+# Learned transliteration dictionary (native-script names -> English words)
+# ------------------------------------------------------------------------------
+# Many Indian records write ENGLISH business words in an Indian script: "परफेक्ट फूड प्राइवेट लिमिटेड"
+# = "Perfect Food Private Limited". anyascii turns that into "prphekt phud praivet limitet", which no
+# string metric links to "perfect food" (name token-set >= 90 for only 5.7% of such true pairs).
+# The business vocabulary is small and repetitive, so a token dictionary is learned from the TRAINING
+# ground truth: true pairs (S1 English name, native-script target name) with the same number of
+# tokens are aligned position by position; a transliterated token maps to the English token it is
+# aligned with in >= TRANSLIT_MIN_SHARE of >= TRANSLIT_MIN_COUNT pairs. With it, 95.7% of validation
+# native-script true pairs reach token-set >= 90. Only records whose raw name contains non-Latin
+# script are rewritten; country stays an open set (it applies wherever such names occur).
+TRANSLIT_VERSION = 1
+TRANSLIT_MIN_COUNT = 3
+TRANSLIT_MIN_SHARE = 0.6
+_TRANSLIT: dict = {}
+_NON_LATIN_SQL = r"[^\x{0000}-\x{024F}]"
+
+
+def _set_translit(d: dict) -> None:
+    global _TRANSLIT
+    _TRANSLIT = dict(d or {})
+
+
+def apply_translit(name_t: str) -> str:
+    if not _TRANSLIT or not name_t:
+        return name_t
+    return " ".join(_TRANSLIT.get(t, t) for t in name_t.split())
+
+
+def translit_dict_path(data_dir: Path) -> Path:
+    return Path(data_dir) / "norm" / f"translit_dict_v{TRANSLIT_VERSION}.json"
+
+
+def build_translit_dict(data_dir: Path) -> dict:
+    """Learn (once) and cache the token dictionary from the training ground truth + training sources."""
+    import json
+    from collections import Counter
+    import duckdb
+    data_dir = Path(data_dir)
+    path = translit_dict_path(data_dir)
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    gt = data_dir / "train_ground_truth.tsv"
+    srcs = [data_dir / f"train_source{k}_final.parquet" for k in (1, 2, 3)]
+    if not gt.is_file() or not all(f.is_file() for f in srcs):
+        print("  [Translit] training files not found -> no transliteration dictionary")
+        return {}
+    print("  [Translit] Learning native-script -> English token dictionary from the training ground truth...")
+    f = [str(x).replace("\\", "/") for x in srcs]
+    g = str(gt).replace("\\", "/")
+    con = duckdb.connect()
+    df = con.execute(
+        "SELECT a.business_name AS en, b.business_name AS nat "
+        "FROM (SELECT source1_entity_id AS s1, unnest(string_split(matched_entity_ids, ',')) AS t "
+        f"      FROM read_csv('{g}', delim='\t', header=true, all_varchar=true) "
+        "      WHERE coalesce(matched_entity_ids, '') <> '') gt "
+        f"JOIN '{f[0]}' a ON a.entity_id = gt.s1 "
+        f"JOIN (SELECT entity_id, business_name FROM '{f[1]}' UNION ALL "
+        f"      SELECT entity_id, business_name FROM '{f[2]}') b ON b.entity_id = gt.t "
+        "WHERE regexp_matches(b.business_name, ?)", [_NON_LATIN_SQL]).df()
+    con.close()
+    co, tot = Counter(), Counter()
+    for en, nat in zip(df["en"].tolist(), df["nat"].tolist()):
+        if not nat or not has_non_latin(nat):
+            continue
+        a_t, b_t = _prep_name(en or ""), _prep_name(nat)
+        # align full names (learns legal words too: praivet -> private) and legal-stripped core names
+        for a, b in ((a_t.split(), b_t.split()), (core_name(a_t).split(), core_name(b_t).split())):
+            if a and len(a) == len(b):
+                for x, y in zip(b, a):
+                    co[(x, y)] += 1
+                    tot[x] += 1
+    best = {}
+    for (x, y), c in co.items():
+        if c >= TRANSLIT_MIN_COUNT and c / tot[x] >= TRANSLIT_MIN_SHARE and (x not in best or c > best[x][1]):
+            best[x] = (y, c)
+    mapping = {x: y for x, (y, _) in best.items() if x != y}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(mapping, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+    print(f"  [Translit] {len(mapping):,} token mappings learned from {len(df):,} native-script true pairs "
+          f"-> {path.name}")
+    return mapping
+
+
 def core_name(name_t: str) -> str:
     toks = [t for t in name_t.split() if t not in LEGAL_TOKENS and not _LEGAL_RE.match(t)]
     if not toks:  # name was only legal words: keep it as-is
@@ -206,13 +293,13 @@ def normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
     addrs = df["business_address"].fillna("").astype(str).tolist()
     houses = df["house_number"].fillna("").astype(str).tolist()
 
-    name_t = [_prep_name(n) for n in names]
+    is_native = [1 if has_non_latin(n) else 0 for n in names]
+    name_t = [apply_translit(_prep_name(n)) if nat else _prep_name(n) for n, nat in zip(names, is_native)]
     name_core = [core_name(n) for n in name_t]
     name_key = [" ".join(sorted(set(c.split()))) for c in name_core]
     name_skel = [skeleton(c) for c in name_core]
     addr_t = [canon_addr(a) for a in addrs]
     house_c = [canon_house(h) for h in houses]
-    is_native = [1 if has_non_latin(n) else 0 for n in names]
 
     return pd.DataFrame({
         "entity_id": df["entity_id"].values,
@@ -249,10 +336,12 @@ def ensure_norm(src_path: Path, n_procs: int = None, batch_rows: int = 200_000) 
     n_procs = n_procs or cpu_threads()
     print(f"  [Norm] Building normalized cache {dst.name} ({n_procs} procs)...")
 
+    translit = build_translit_dict(Path(src_path).parent)
+    _set_translit(translit)
     pf = pq.ParquetFile(str(src_path))
     writer = None
     batch_iter = pf.iter_batches(batch_size=batch_rows, columns=_SRC_COLS)
-    with Pool(n_procs) as pool:
+    with Pool(n_procs, initializer=_set_translit, initargs=(translit,)) as pool:
         while True:
             # Bounded window: at most n_procs batches in memory at once
             window = []

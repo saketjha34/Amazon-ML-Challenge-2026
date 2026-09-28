@@ -55,6 +55,8 @@ class EntityResolutionTuner:
         val_s1_ids: List[str],
         output_dir: Optional[Path] = None,
         train_groups: Optional[np.ndarray] = None,
+        sample_weight: Optional[np.ndarray] = None,
+        fp_weight: float = 1.0,
     ) -> Tuple[Dict[str, Any], float, float]:
         import xgboost as xgb
 
@@ -70,12 +72,14 @@ class EntityResolutionTuner:
             sel = np.ones(len(X_train), dtype=bool)
         Xt = np.ascontiguousarray(X_train.values[sel], dtype=np.float32)
         yt = np.ascontiguousarray(y_train.values[sel], dtype=np.int32)
+        wt = None if sample_weight is None else np.ascontiguousarray(np.asarray(sample_weight)[sel], dtype=np.float32)
         Xv = np.ascontiguousarray(X_val[X_train.columns].values, dtype=np.float32)
         yv = np.fromiter((c in ground_truth_map.get(s, ()) for s, c in
                           zip(val_pairs_df["s1_id"].values, val_pairs_df["candidate_id"].values)),
                          dtype=np.int32, count=len(val_pairs_df))
         print(f"\n[Optuna] {self.n_trials} trials (timeout {self.timeout}s) | trial train rows {len(Xt):,} "
-              f"({self.train_frac:.0%} of train S1) | val rows {len(Xv):,} | objective: val Macro F0.5")
+              f"({self.train_frac:.0%} of train S1) | val rows {len(Xv):,} | objective: val Macro F0.5 "
+              f"(false matches x{fp_weight}, distractor weights {'on' if wt is not None else 'off'})")
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         def objective(trial: optuna.Trial) -> float:
@@ -102,7 +106,7 @@ class EntityResolutionTuner:
                 "max_bin": trial.suggest_categorical("max_bin", [256, 512]),
             }
             clf = xgb.XGBClassifier(**params)
-            clf.fit(Xt, yt, eval_set=[(Xv, yv)], verbose=False)
+            clf.fit(Xt, yt, sample_weight=wt, eval_set=[(Xv, yv)], verbose=False)
             best_it = int(clf.best_iteration) + 1
             booster = clf.get_booster()
             try:
@@ -112,17 +116,18 @@ class EntityResolutionTuner:
             except Exception:
                 probs = booster.inplace_predict(Xv, iteration_range=(0, best_it))
             (t1, t2), sw = sweep_thresholds_2d(val_pairs_df, probs, ground_truth_map, val_s1_ids,
-                                               min_thresh=0.1, max_thresh=0.96, step=0.04)
+                                               min_thresh=0.1, max_thresh=0.96, step=0.04, fp_weight=fp_weight)
             b = sw.iloc[0]
             trial.set_user_attr("best_iteration", best_it)
             trial.set_user_attr("t1", t1)
             trial.set_user_attr("t2", t2)
             trial.set_user_attr("precision", float(b["precision"]))
             trial.set_user_attr("recall", float(b["recall"]))
-            print(f"  [Trial {trial.number:02d}] F0.5 {b['macro_f05']:.4f} | P {b['precision']:.4f} R {b['recall']:.4f} "
+            print(f"  [Trial {trial.number:02d}] F0.5 {b['macro_f05']:.4f} (objective {b['macro_f05_fpw']:.4f}) "
+                  f"| P {b['precision']:.4f} R {b['recall']:.4f} "
                   f"| trees {best_it} depth {params['max_depth']} lr {params['learning_rate']:.3f} "
                   f"| {time.time() - t0:.0f}s", flush=True)
-            return float(b["macro_f05"])
+            return float(b["macro_f05_fpw"])
 
         sampler = optuna.samplers.TPESampler(seed=self.random_seed, n_startup_trials=min(8, self.n_trials))
         self.study = optuna.create_study(direction="maximize", sampler=sampler)

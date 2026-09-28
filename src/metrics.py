@@ -128,14 +128,19 @@ def decide_matches(scored: pd.DataFrame, t1: float, t2: float, max_matches_per_s
     return acc.groupby("s1_id", sort=False)["candidate_id"].apply(list).to_dict()
 
 
-def _fast_eval(dec: pd.DataFrame, accepted: np.ndarray, s1_codes: np.ndarray, n_true: np.ndarray) -> Dict[str, float]:
-    """Vectorized Macro F0.5 over all eval entities (entities without candidates predict nothing)."""
+def _fast_eval(dec: pd.DataFrame, accepted: np.ndarray, s1_codes: np.ndarray, n_true: np.ndarray,
+               fp_weight: float = 1.0) -> Dict[str, float]:
+    """
+    Vectorized Macro F0.5 over all eval entities (entities without candidates predict nothing).
+    fp_weight > 1 counts every false match as that many (test-calibrated selection: the test set has
+    more distractor targets than validation, so a false match is more likely there).
+    """
     n = len(n_true)
     pred = np.bincount(s1_codes[accepted], minlength=n)
     tp = np.bincount(s1_codes[accepted & dec["label"].values], minlength=n)
     single = n_true == 0
     with np.errstate(divide="ignore", invalid="ignore"):
-        p = np.where(pred > 0, tp / np.maximum(pred, 1), 0.0)
+        p = np.where(pred > 0, tp / np.maximum(tp + fp_weight * (pred - tp), 1e-9), 0.0)
         r = np.where(n_true > 0, tp / np.maximum(n_true, 1), 0.0)
         f = np.where(tp > 0, 1.25 * p * r / (0.25 * p + r), 0.0)
     f = np.where(single, (pred == 0).astype(float), f)
@@ -216,6 +221,7 @@ def sweep_thresholds_2d(
     step: float = 0.02,
     max_matches_per_s1: int = 10,
     exclusive_targets: bool = True,
+    fp_weight: float = 1.0,
 ) -> Tuple[Tuple[float, float], pd.DataFrame]:
     """
     Two-level sweep over (t1 for the top-1 candidate, t2 for the others) maximizing Macro F_0.5.
@@ -227,12 +233,17 @@ def sweep_thresholds_2d(
     records = []
     for t1 in grid:
         for t2 in grid:
-            m = _fast_eval(dec, accept_mask(dec, t1, t2, max_matches_per_s1), codes, n_true)
+            acc = accept_mask(dec, t1, t2, max_matches_per_s1)
+            m = _fast_eval(dec, acc, codes, n_true)
+            m["macro_f05_fpw"] = (_fast_eval(dec, acc, codes, n_true, fp_weight)["macro_f05"]
+                                  if fp_weight != 1.0 else m["macro_f05"])
             m["t1"], m["t2"] = t1, t2
             records.append(m)
     sweep_df = pd.DataFrame(records)
-    cols = ["t1", "t2", "macro_f05", "precision", "recall", "singleton_accuracy", "total_matches_predicted"]
-    sweep_df = sweep_df[cols].sort_values("macro_f05", ascending=False).reset_index(drop=True)
+    cols = ["t1", "t2", "macro_f05", "macro_f05_fpw", "precision", "recall", "singleton_accuracy",
+            "total_matches_predicted"]
+    # ranked by the (possibly false-match-weighted) objective; macro_f05 is always the plain metric
+    sweep_df = sweep_df[cols].sort_values(["macro_f05_fpw", "macro_f05"], ascending=False).reset_index(drop=True)
     best = sweep_df.iloc[0]
     return (float(best["t1"]), float(best["t2"])), sweep_df
 

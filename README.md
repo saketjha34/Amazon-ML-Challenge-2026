@@ -11,7 +11,51 @@ The challenge statement is in [docs/PROBLEM_STATEMENT.md](docs/PROBLEM_STATEMENT
 | --- | --- | --- | --- | --- | --- |
 | `run_50k_v2` | 0.9684 | 0.9928 | 0.9317 | 0.9718 | — |
 | `run_100k_v1` (XGBoost + stacking) | 0.9693 | 0.9945 | 0.9312 | 0.9709 | **0.948** |
-| `run_100k_v2` (+ context features) | *pending* | | | | |
+| `run_100k_v2` (+ context features) | 0.9745 | 0.9970 | 0.9409 | 0.971 | 0.953 (0.9597 with stricter thresholds) |
+| `run_50k_v3` (v3 approach, below) | 0.9832 | 0.9982 | 0.9546 | 0.9880 | 0.9687 |
+| **`run_70k_v1`** (v3 + target-duplicate features, **final**) | **0.9835** | 0.9984 | 0.9555 | 0.9882 | 0.96755 (val thresholds) → 0.96958 (0.60/0.97) → **0.96964 (t1 0.75 / t2 0.985, submitted)** |
+| `run_70k_opt` (Optuna-tuned XGBoost) | 0.9831 | 0.9986 | 0.9551 | 0.9882 | 0.96937 (0.75/0.985) |
+
+### Reproduce the final submission
+
+```bash
+# 1) train on the first 70,000 Source 1 businesses (85% train / 15% validation), ~45 min
+python run_pipeline.py --mode train --sample-size 70000 --train-split 0.85 --run-name run_70k_v1 --model-type xgboost --device cuda --cpu-threads 12
+# 2) validate: thresholds + metrics/metrics.json, ~3 min
+python run_pipeline.py --mode val --run-name run_70k_v1 --device cuda --cpu-threads 12
+# 3) test: blocking + scoring of all 1.73M test S1 -> output/candidate_pairs.tsv + test scores, ~45 min
+#    (~1 h 45 min when the test blocking is not reused from an earlier run)
+python run_pipeline.py --mode test --run-name run_70k_v1 --device cuda --cpu-threads 12
+# 4) final decision thresholds (stricter than validation; chosen on the leaderboard), ~5 min
+python run_pipeline.py --mode decide --t1 0.75 --t2 0.985 --run-name run_70k_v1 --cpu-threads 12
+```
+Final files: `runs/run_70k_v1/output/decide_t1_0.75_t2_0.98/matching_results.tsv` (the folder name rounds
+0.985) and `runs/run_70k_v1/output/candidate_pairs.tsv`.
+
+**v4 addition (in `run_70k_v1`): target duplicate features** (`src/context.py`, `DUP_COLUMNS`). Distractor
+records (S2/S3 records that belong to no S1 business) are single perturbed copies: only 1.2% of them share
+(name key, house number) with another S2/S3 record and 4.6% share the exact address, vs 32% / 43% of real
+records. Six counts per candidate (other records sharing name key + house number, exact address, name key +
+city, name skeleton + house number, and the first two counted in the other source only) let the model
+separate a look-alike distractor from a real record. The test set has ~2x more distractors per S1 than
+training, which is also why stricter-than-validation thresholds score higher on the leaderboard.
+
+### v3 approach (what changed and why)
+
+Measured on `run_100k_v2`, a perfect model on its candidates scores only 0.989 on validation, and the
+leaderboard reacts to thresholds as if the test set has many more distractors than validation. v3 fixes
+the measured holes:
+
+| Change | Where | Evidence |
+| --- | --- | --- |
+| **Learned transliteration dictionary** for native-script names ("फ्यूचर इंडस्ट्रीज" → "future industries"), learned from training ground truth (normalization v3) | `src/text_norm.py` | native-script true pairs with name token-set ≥ 90: 5.7% → 95.7% |
+| **Reverse retrieval**: each target's best 5 S1 in the whole S1 file become candidates (`rev_knn`, `rev_rank`) | `src/blocking.py` | recovers 31.5% of the true links plain retrieval never finds |
+| **Legal-form agreement + Jaro-Winkler features** (LLC vs Inc transfers to SARL vs SAS) | `src/features.py` | France look-alikes differ mainly by legal form |
+| **Distractor-aware training**: negatives on targets owned by no S1 weighted ×1.9 (`ORPHAN_NEG_WEIGHT`) | `src/pipeline.py` | test ≈ 40% unowned targets vs 26% in training |
+| **Test-calibrated thresholds**: sweep counts each false match ×2 (`THRESHOLD_FP_WEIGHT`); the plain validation optimum is also stored | `src/metrics.py` | stricter thresholds: 0.953 → 0.957 → 0.9597 on the leaderboard |
+
+Turn pieces off with `--orphan-weight 1.0` (retrain needed), `--fp-weight 1.0` (re-run `val` only), or
+`BLOCKING_PARAMS["reverse_k"] = 0`.
 
 **Contents**
 1. [Setup from scratch](#1-setup-from-scratch)
